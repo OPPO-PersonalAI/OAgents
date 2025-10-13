@@ -48,8 +48,6 @@ from scripts.async_web_crawler import (
 )
 from scripts.automodel import get_api_model, process_selected_tasks_param, prepare_model_kwargs
 
-from agent_kb.agent_kb_utils import AKBClient, call_model
-
 from oagents.memory import ActionStep, PlanningStep, TaskStep
 from tqdm import tqdm
 
@@ -137,11 +135,6 @@ def parse_args():
     parser.add_argument('--summary', action='store_true', default=False, help='Summarize the current step memory')
     parser.add_argument('--use_long_term_memory', action='store_true', default=False, help='Use long-term memory')
     parser.add_argument('--retrieve_key_memory', action='store_true', default=False, help='Retrieve key memory')
-    # agent_kb params
-    parser.add_argument('--agent_kb', action='store_true', default=False, help='Enable knowledge base retrieval')
-    parser.add_argument('--retrieval_type', type=str, choices=["text", "semantic", "hybrid"], default="hybrid", help="Type of retrieval method")
-    parser.add_argument('--top_k', type=int, default=3, help="Retrieval params top_k")
-    parser.add_argument('--model_id_retrieval', type=str, default="gpt-4.1", help="Agent kb model choice")
     
     return parser.parse_args()
 
@@ -193,10 +186,6 @@ def create_agent_hierarchy(model: Model, model_search: Model, args, debug=False)
         summary=args.summary,
         use_long_term_memory=args.use_long_term_memory,
         retrieve_key_memory=args.retrieve_key_memory,
-        
-        agent_kb=args.agent_kb,
-        top_k=args.top_k,
-        retrieval_type=args.retrieval_type,
     )
     return manager_agent
 
@@ -230,86 +219,8 @@ def extract_intermediate_steps(agent):
         intermediate_steps.append(step_dict)
     return intermediate_steps
 
-def student_retrieval_process(example, args, model_id_retrieval, key, url):
 
-    akb_client = AKBClient()
-    
-    with open("./agent_kb/prompts.yaml", "r") as f:
-        prompts = yaml.safe_load(f)
-    
-    student_agent_reason_template = prompts["student_agent_reason"]
-    student_agent_refine_template = prompts["student_agent_refine"]
-    
-    student_reason = student_agent_reason_template.format(
-        user_query=example["question"]
-    )
-    
-    retrieval_method = {
-        "hybrid": akb_client.hybrid_search,
-        "text": akb_client.text_search,
-        "semantic": akb_client.semantic_search
-    }[args.retrieval_type]
-    
-    student_retrieval_results = retrieval_method(student_reason, top_k=args.top_k)
-
-    student_retrieval = ""
-    for result in student_retrieval_results:
-        student_retrieval += "\nSimilar task:\n"
-        student_retrieval += result['query']
-        student_retrieval += "\nSuggestions:\n"
-        student_retrieval += result['agent_experience']
-    student_refine = student_agent_refine_template.format(
-        knowledge=student_retrieval
-    )
-    
-    student_suggestions = call_model(query=student_refine, model_name=model_id_retrieval, key=key, url=url)
-    
-    return student_suggestions, retrieval_method, prompts
-
-def teacher_retrieval_process(example, agent, args, retrieval_method, prompts, model_id_retrieval, key, key_search, url, url_search, output):
-
-    intermediate_steps = extract_intermediate_steps(agent)
-    
-    annotated_example = {
-        "question": example["question"],
-        "prediction": output,
-        "intermediate_steps": intermediate_steps,
-    }
-    
-    teacher_agent_reason_template = prompts["teacher_agent_reson"]
-    teacher_agent_refine_template = prompts["teacher_agent_refine"]
-    
-    teacher_reason = teacher_agent_reason_template.format(
-        agent_log=str(annotated_example)
-    )
-    summary = call_model(query=teacher_reason, model_name=model_id_retrieval, key=key_search, url=url_search)
-    
-    log_plan = None
-    for memory_step in agent.memory.steps:
-        if isinstance(memory_step, PlanningStep):
-            step_dict = memory_step.dict()
-            log_plan = step_dict.get('plan', '')
-            break
-    
-    teacher_retrieval_results = retrieval_method(example["question"] + (log_plan or '') + summary, top_k=args.top_k)
-    
-    teacher_retrieval = ""
-    for result in teacher_retrieval_results:
-        teacher_retrieval += "\nSimilar task:\n"
-        teacher_retrieval += result['query']
-        teacher_retrieval += "\nSuggestions:\n"
-        teacher_retrieval += result['agent_experience']
-    
-    teacher_refine = teacher_agent_refine_template.format(
-        knowledge=teacher_retrieval,
-        log_summary=summary
-    )
-    
-    teacher_suggestions = call_model(query=teacher_refine, model_id=model_id_retrieval, key=key, url=url)
-    
-    return teacher_suggestions
-
-def answer_single_question(example, args, model_id, model_id_search, answers_file, debug=False, retrieval=False):
+def answer_single_question(example, args, model_id, model_id_search, answers_file, debug=False):
 
     text_limit = 100000
     model_name, key, url, model_wrapper = get_api_model(model_id)
@@ -364,39 +275,8 @@ Here is the task:
 
     start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        if retrieval:
-            model_name_retrieval = args.model_id_retrieval
-            
-            student_suggestions, retrieval_method, prompts = student_retrieval_process(
-                example, args, model_name_retrieval, key, url
-            )
-            
-            final_result = agent.run(augmented_question, additional_knowledge=student_suggestions)
-            # agent_memory = agent.write_memory_to_messages(summary_mode=True)
-            # final_result = prepare_response(augmented_question, agent_memory, reformulation_model=model)
-            output = str(final_result)
-            
-            semantic_match_template = prompts["semantic_match_prompt"]
-            
-            output_query = semantic_match_template.format(
-                question=example["question"],
-                prediction=output,
-                true_answer=example["true_answer"]
-            )
-            
-            semantic_check = call_model(query=output_query, model_name=model_name_retrieval, key=key_search, url=url_search)
-            
-            if (not question_scorer(output, example["true_answer"])) and (semantic_check == "false"):
-                teacher_suggestions = teacher_retrieval_process(
-                    example, agent, args, retrieval_method, prompts,
-                    model_name_retrieval, key, key_search, url, url_search, output
-                )
-                
-                final_result = agent.run(augmented_question, additional_knowledge=teacher_suggestions)
-                output = str(final_result)
-        else:
-            final_result = agent.run(augmented_question)
-            output = str(final_result)
+        final_result = agent.run(augmented_question)
+        output = str(final_result)
 
         intermediate_steps = extract_intermediate_steps(agent)
         
@@ -472,11 +352,11 @@ def main():
     tasks_to_run = get_examples_to_answer(answers_file, eval_df, selected_tasks, level, args.debug)
     if args.debug or args.concurrency == 1:
         for example in tasks_to_run:
-            answer_single_question(example, args, args.model_id, args.model_id_search, answers_file, args.debug, args.agent_kb)
+            answer_single_question(example, args, args.model_id, args.model_id_search, answers_file, args.debug)
     else:
         with ThreadPoolExecutor(max_workers=args.concurrency) as exe:
             futures = [
-                exe.submit(answer_single_question, example, args, args.model_id, args.model_id_search, answers_file, args.debug, args.agent_kb)
+                exe.submit(answer_single_question, example, args, args.model_id, args.model_id_search, answers_file, args.debug)
                 for example in tasks_to_run
             ]
             for f in tqdm(as_completed(futures), total=len(tasks_to_run), desc="Processing tasks"):
